@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mobius": {
+      "command": "uvx",
+      "args": ["--from", "mobius-ai[claude]", "mobius", "mcp", "serve"]
+    }
+  }
+}

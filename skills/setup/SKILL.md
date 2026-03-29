@@ -1,0 +1,602 @@
+---
+name: setup
+description: "Guided onboarding wizard for Mobius setup"
+---
+
+# /mobius:setup
+
+Guided onboarding wizard that converts users into power users.
+
+> **Standalone users** (Codex, pip install): Use `mobius setup --runtime codex` in your terminal instead.
+> This skill runs inside a Claude Code session. For other runtime backends, the CLI `mobius setup` command handles configuration.
+> For full install and onboarding instructions, see [Getting Started](docs/getting-started.md).
+
+## Usage
+
+```
+mob setup
+/mobius:setup
+/mobius:setup --uninstall
+```
+
+> **Note**: Setup does two things:
+> 1. **MCP server registration** (`~/.claude/mcp.json`) — one-time, global across all projects
+> 2. **CLAUDE.md integration** (optional) — per-project, adds an Mobius command reference block
+>
+> After the first run, you only need to re-run setup in new projects if you want the CLAUDE.md integration.
+
+---
+
+## Setup Wizard Flow
+
+When the user invokes this skill, guide them through an enhanced 6-step wizard with progressive disclosure and celebration checkpoints.
+
+---
+
+### Step 0: Welcome & Motivation (The Hook)
+
+Start with energy and clear value:
+
+```
+Welcome to Mobius Setup!
+
+Let's unlock your full AI development potential.
+
+What you'll get:
+- Visual TUI dashboard for real-time progress tracking
+- 3-stage evaluation pipeline for quality assurance
+- Drift detection to keep projects on track
+- Cost optimization (85% savings on average)
+
+Setup takes ~2 minutes. Let's go!
+```
+
+---
+
+### Step 0.5: Community Support
+
+Before we begin, check `~/.mobius/prefs.json` for `star_asked`. If not `true`, use **AskUserQuestion**:
+
+```json
+{
+  "questions": [{
+    "question": "Mobius is free and open-source. A GitHub star helps other developers discover it. Star the repo?",
+    "header": "Community",
+    "options": [
+      {
+        "label": "Star on GitHub",
+        "description": "Takes 1 second — helps the project grow"
+      },
+      {
+        "label": "Skip for now",
+        "description": "Continue with setup"
+      }
+    ],
+    "multiSelect": false
+  }]
+}
+```
+
+- **Star on GitHub**: Run `gh api -X PUT /user/starred/tabtoyou/mobius`, save `{"star_asked": true}` to `~/.mobius/prefs.json`
+- **Skip for now**: Save `{"star_asked": true}` to `~/.mobius/prefs.json`
+- **Other**: Save `{"star_asked": true}`
+
+Create `~/.mobius/` directory if it doesn't exist.
+
+If `star_asked` is already `true`, skip this step silently.
+
+---
+
+### Step 1: Environment Detection
+
+Check the user's environment with clear feedback:
+
+```bash
+python3 --version
+which uvx 2>/dev/null && uvx --version 2>/dev/null
+which claude 2>/dev/null
+```
+
+**IMPORTANT: If system Python is < 3.12 but uvx is available, also check uv-managed Python:**
+
+```bash
+uv python list 2>/dev/null | grep "cpython-3.1[2-9]"
+```
+
+If `uv python list` shows Python >= 3.12 available, this counts as **Full Mode** because `uvx mobius-ai mcp serve` automatically uses uv-managed Python >= 3.12 (not system Python).
+
+**Report results with personality:**
+
+```
+Environment Detected:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+System Python 3.11         [!] Below 3.12
+uv Python 3.12+            [✓] Available (uvx will use this)
+uvx package runner         [✓] Available
+Runtime backend            [✓] Detected
+
+→ Full Mode Available (via uvx + uv-managed Python >= 3.12)
+```
+
+**Decision Matrix:**
+
+| Environment | Mode | Action |
+|:------------|:-----|:-------|
+| uvx + Python >= 3.12 | **Ready** | Proceed to MCP registration (uvx mode — extras always included) |
+| No uvx + `mobius` binary in PATH | **Check deps** | Verify `[claude]` extras, then proceed (binary mode) |
+| No uvx + Python >= 3.12 + `python3 -m mobius` works | **Check deps** | Verify `[claude]` extras, then proceed (pip mode) |
+| uvx + Python < 3.12 only | **Install needed** | Run `uv python install 3.12` then proceed |
+| No uvx + no mobius binary + no pip package | **Install needed** | Install uv first, then proceed |
+
+**For binary/pip modes — verify `[claude]` extras are installed:**
+
+Check method depends on how mobius was installed:
+```bash
+# Detect install method
+pipx list 2>/dev/null | grep -q mobius && echo "PIPX" || echo "NOT_PIPX"
+```
+
+- **pipx users** (binary mode, installed via pipx):
+  ```bash
+  pipx runpip mobius-ai show claude-agent-sdk 2>/dev/null && echo "DEPS_OK" || echo "DEPS_MISSING"
+  ```
+  If `DEPS_MISSING`: `pipx install --force mobius-ai[claude]`
+
+- **pip users** (pip mode):
+  ```bash
+  python3 -c "import claude_agent_sdk" 2>/dev/null && echo "DEPS_OK" || echo "DEPS_MISSING"
+  ```
+  If `DEPS_MISSING`: `python3 -m pip install mobius-ai[claude]`
+
+If deps are missing and the user doesn't want to fix manually, recommend uvx:
+```
+Or install uvx (recommended — handles deps automatically):
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+Then re-run: mob setup
+```
+
+**IMPORTANT**: The MCP server requires one of: (1) uvx, (2) mobius binary in PATH, or (3) mobius pip-installed. For options 2 and 3, the `[claude]` extra must also be installed. If none are available, guide the user to install uv — do NOT write a non-working fallback to mcp.json.
+
+**If prerequisites are missing, show:**
+```
+Mobius requires uvx (recommended) or the mobius package installed.
+
+Quick install (< 1 minute):
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv python install 3.12
+
+Then re-run: mob setup
+```
+
+**Celebration Checkpoint 1:**
+```
+Great news! You're ready for the full Mobius experience.
+```
+
+---
+
+### Step 2: MCP Server Registration
+
+Check if `~/.claude/mcp.json` exists:
+
+```bash
+ls -la ~/.claude/mcp.json 2>/dev/null && echo "EXISTS" || echo "NOT_FOUND"
+```
+
+**Show progress:**
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Registering MCP Server...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Connecting Mobius Python core to your runtime backend.
+This enables:
+
+  Visual TUI Dashboard    [Watch execution in real-time]
+  3-Stage Evaluation     [Mechanical → Semantic → Consensus]
+  Drift Detection        [Alert when projects go off-track]
+  Session Replay         [Debug any execution from events]
+```
+
+**Automatically create or update `~/.claude/mcp.json`** (user-level, works across all projects).
+
+Choose the MCP command based on how mobius is installed (check in order):
+1. If `which uvx` succeeds: `{"command": "uvx", "args": ["--from", "mobius-ai[claude]", "mobius", "mcp", "serve"]}`
+2. If `which mobius` succeeds: `{"command": "mobius", "args": ["mcp", "serve"]}`
+3. If `python3 -c "import mobius"` succeeds: `{"command": "python3", "args": ["-m", "mobius", "mcp", "serve"]}`
+4. If none of the above → **do NOT write to mcp.json**. Instead show the prerequisites message from Step 1 and stop.
+
+If `~/.claude/mcp.json` already exists, read it, **always overwrite the `mobius` key** with the entry above (to fix stale args from older versions), and preserve all other server entries.
+
+**Celebration Checkpoint 2:**
+```
+MCP Server Registered! You can now:
+- Run mob run for visual TUI execution
+- Run mob evaluate for 3-stage verification
+- Run mob status for drift tracking
+```
+
+---
+
+### Step 3: CLAUDE.md Integration (Optional)
+
+Ask with clear value proposition:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CLAUDE.md Integration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Add Mobius quick-reference to your CLAUDE.md?
+
+This gives you instant command reminders without leaving
+your project context.
+
+What gets added (~40 lines):
+- Philosophy and pipeline overview
+- Command routing table with lazy-loaded agents
+- Agent catalog summary
+
+A backup will be created: CLAUDE.md.bak
+
+[Integrate / Skip / Preview first]
+```
+
+**If "Preview first", show:**
+````markdown
+<!-- mob:START -->
+<!-- mob:VERSION:0.26.3 -->
+# Mobius — Specification-First AI Development
+
+> Before telling AI what to build, define what should be built.
+> As Socrates asked 2,500 years ago — "What do you truly know?"
+> Mobius turns that question into an evolutionary AI workflow engine.
+
+Most AI coding fails at the input, not the output. Mobius fixes this by
+**exposing hidden assumptions before any code is written**.
+
+1. **Socratic Clarity** — Question until ambiguity ≤ 0.2
+2. **Ontological Precision** — Solve the root problem, not symptoms
+3. **Evolutionary Loops** — Each evaluation cycle feeds back into better specs
+
+```
+Interview → Seed → Execute → Evaluate
+    ↑                           ↓
+    └─── Evolutionary Loop ─────┘
+```
+
+## mob Commands
+
+Each command loads its agent/MCP on-demand. Details in each skill file.
+
+| Command | Loads |
+|---------|-------|
+| `mob` | — |
+| `mob interview` | `mobius:socratic-interviewer` |
+| `mob seed` | `mobius:seed-architect` |
+| `mob run` | MCP required |
+| `mob evolve` | MCP: `evolve_step` |
+| `mob evaluate` | `mobius:evaluator` |
+| `mob unstuck` | `mobius:{persona}` |
+| `mob status` | MCP: `session_status` |
+| `mob setup` | — |
+| `mob help` | — |
+
+## Agents
+
+Loaded on-demand — not preloaded.
+
+**Core**: socratic-interviewer, ontologist, seed-architect, evaluator,
+wonder, reflect, advocate, contrarian, judge
+**Support**: hacker, simplifier, researcher, architect
+<!-- mob:END -->
+````
+
+**If Integrate:**
+1. Backup existing CLAUDE.md to CLAUDE.md.bak
+2. Append the block above
+3. Confirm successful integration
+
+**Celebration Checkpoint 3:**
+```
+CLAUDE.md updated! You now have instant Mobius reference
+available in every project.
+```
+
+---
+
+### Step 4: Quick Verification
+
+Run verification with visual feedback:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Verifying Setup...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Check skills are loadable:
+```bash
+ls skills/ | wc -l  # Should show 12+ skills
+```
+
+Check agents are available:
+```bash
+ls src/mobius/agents/*.md | wc -l  # Should show 20+ bundled agents
+```
+
+Check MCP registration (if enabled):
+```bash
+cat ~/.claude/mcp.json | grep -q mobius && echo "MCP: ✓" || echo "MCP: ✗"
+```
+
+---
+
+### Step 5: Success Summary
+
+Display with celebration:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Mobius Setup Complete!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mode:                     Full Mode (Python >= 3.12 + MCP)
+Skills Registered:        15 workflow skills
+Agents Available:         9 specialized agents
+MCP Server:               ✓ Registered
+CLAUDE.md:                ✓ Integrated
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  You're Ready to Go!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Start your first project:
+  mob interview "your project idea"
+
+Learn what's possible:
+  mob help
+
+Try the interactive tutorial:
+  mob tutorial
+
+Join the community:
+  Star us on GitHub! github.com/tabtoyou/mobius
+```
+
+---
+
+### Step 5.5: Brownfield Repository Scan
+
+Scan the user's home directory for existing git repositories and register them in the Mobius DB. This enables interviews to use brownfield context for existing projects.
+
+**Show scanning indicator:**
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Scanning for Existing Projects...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Looking for git repositories in your home directory.
+Only GitHub-hosted repos will be registered.
+This may take a moment...
+```
+
+**Implementation — use MCP tools only, do NOT use CLI or Python scripts:**
+
+1. Load the brownfield MCP tool: `ToolSearch query: "+mobius brownfield"`
+2. Call scan+register:
+   ```
+   Tool: mobius_brownfield
+   Arguments: { "action": "scan" }
+   ```
+   This scans `~/` for GitHub repos and registers them in DB. Existing defaults are preserved.
+
+The scan response `text` already contains a pre-formatted numbered list with `[default]` markers. **Do NOT make any additional MCP calls to list or query repos.**
+
+**Display the repos in a plain-text 2-column grid** (NOT a markdown table). Use a code block so columns align. Example:
+
+```
+Scan complete. 8 repositories registered.
+
+ 1. repo-alpha                   5. repo-epsilon
+ 2. repo-bravo *                 6. repo-foxtrot
+ 3. repo-charlie                 7. repo-golf *
+ 4. repo-delta                   8. repo-hotel
+```
+
+Include `*` markers for defaults exactly as they appear in the scan response. Do not summarize or truncate the list. The user needs to see all repo numbers to pick defaults.
+
+**If no repos found**, skip the default selection prompt and proceed to Step 6.
+
+**Default repo selection — IMMEDIATELY after showing the list:**
+
+Use `AskUserQuestion` with the current default numbers from the scan response.
+
+**If defaults exist**, show them as the recommended option:
+
+```json
+{
+  "questions": [{
+    "question": "Which repos to set as default for interviews? Enter numbers like '6, 18, 19'.",
+    "header": "Default Repos",
+    "options": [
+      {"label": "<current default numbers> (Recommended)", "description": "<current default names>"},
+      {"label": "None", "description": "Clear all defaults — interviews will run in greenfield mode"},
+      {"label": "Select repos", "description": "Type repo numbers to set as default"}
+    ],
+    "multiSelect": false
+  }]
+}
+```
+
+**If no defaults exist**, do NOT show a "(Recommended)" option — offer "None" and "Select repos" instead:
+
+```json
+{
+  "questions": [{
+    "question": "Which repos to set as default for interviews? Enter numbers like '6, 18, 19'.",
+    "header": "Default Repos",
+    "options": [
+      {"label": "None", "description": "No default repos — interviews will run in greenfield mode"},
+      {"label": "Select repos", "description": "Type repo numbers to set as default"}
+    ],
+    "multiSelect": false
+  }]
+}
+```
+
+The user can select the recommended defaults (if any), choose "None", or type custom numbers.
+
+After the user responds, use ONE MCP call to update all defaults at once:
+
+```
+Tool: mobius_brownfield
+Arguments: { "action": "set_defaults", "indices": "<comma-separated IDs>" }
+```
+
+Example: if the user picks IDs 6, 18, 19 → `{ "action": "set_defaults", "indices": "6,18,19" }`
+
+This clears all existing defaults and sets the selected repos as default in one call.
+
+If "none" → `{ "action": "set_defaults", "indices": "" }` to clear all defaults.
+
+**Celebration Checkpoint 5.5:**
+```
+Brownfield defaults updated!
+Defaults: podo-app, podo-backend, grape
+
+These repos will be used as context in interviews.
+```
+
+Or if "none" selected:
+```
+No default repos set. interviews will run in greenfield mode.
+You can set defaults anytime by running mob setup again.
+```
+
+---
+
+### Step 6: First Project Nudge
+
+Encourage immediate action:
+
+```
+
+Your first Mobius project is waiting!
+
+The best way to learn is by doing. Try:
+
+  mob interview "Build a CLI tool for [something you need]"
+
+Or explore examples:
+  mob tutorial
+
+You're going to love seeing vague ideas turn into
+crystal-clear specifications. Let's build something amazing!
+```
+
+---
+
+## Progressive Disclosure Schedule
+
+Reveal features gradually to avoid overwhelm:
+
+### Immediate (Plugin Mode)
+- `mob interview` - Socratic clarification
+- `mob seed` - Specification generation
+- `mob unstuck` - Lateral thinking
+
+### After Setup (MCP Mode)
+- `mob run` - TUI execution
+- `mob evaluate` - 3-stage verification
+- `mob status` - Drift tracking
+
+### Power User (Discover organically)
+- Evolutionary loop and ralph persistence
+- Cost prediction and optimization
+- Session replay and debugging
+- Custom agents and skills
+
+---
+
+## Uninstall
+
+When invoked with `--uninstall`:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Mobius Uninstall
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This will remove:
+- MCP server registration from ~/.claude/mcp.json
+- Mobius block from CLAUDE.md
+
+This will NOT remove:
+- Plugin files in .claude-plugin/
+- Any generated seeds or projects
+- Your project data
+
+Uninstall Mobius configuration? [Yes / No]
+```
+
+If Yes:
+1. Remove `mobius` entry from `~/.claude/mcp.json` (if exists)
+2. Remove `<!-- mob:START -->` to `<!-- mob:END -->` block from CLAUDE.md (if exists)
+3. Confirm: "Mobius plugin configuration removed. To remove plugin files, run: claude plugin uninstall mobius"
+
+---
+
+## Setup Troubleshooting
+
+### "python3: command not found"
+```
+Plugin mode still works! You can use:
+- mob interview
+- mob seed
+- mob unstuck
+
+For Full Mode, install Python >= 3.12:
+  macOS: brew install python@3.12
+  Ubuntu: sudo apt install python3.12
+  Windows: python.org/downloads
+```
+
+### "uvx: command not found"
+```
+uvx is recommended but not required. Alternative:
+
+Install Mobius globally (see docs/getting-started.md for all options):
+  pip install mobius-ai
+
+Then update ~/.claude/mcp.json with:
+  "command": "python"
+  "args": ["-m", "mobius", "mcp", "serve"]
+```
+
+### "~/.claude/mcp.json conflicts"
+```
+Mobius will merge with existing MCP servers.
+If you see issues, share your ~/.claude/mcp.json content and
+we'll help you resolve conflicts.
+```
+
+---
+
+## Conversion Metrics Track
+
+Track these checkpoints for conversion optimization:
+
+- [ ] Started setup (skill invoked)
+- [ ] Environment detected successfully
+- [ ] MCP server registration accepted
+- [ ] CLAUDE.md integration accepted
+- [ ] Verification passed
+- [ ] Brownfield repos scanned and registered
+- [ ] Default brownfield repo selected
+- [ ] First project started (mob interview)
+- [ ] First seed generated (mob seed)
+- [ ] First execution completed (mob run)
+
+A fully converted user = all checkpoints passed

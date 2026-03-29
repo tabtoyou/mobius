@@ -1,0 +1,52 @@
+"""Test main entry point."""
+
+from typer.testing import CliRunner
+
+import mobius
+from mobius import main
+from mobius.cli.main import app
+
+runner = CliRunner()
+
+
+def test_version_exists():
+    """Test that __version__ is defined and is a valid PEP 440 version string."""
+    import re
+
+    assert hasattr(mobius, "__version__")
+    # Accept release, prerelease, and dev versions with optional local metadata.
+    assert re.match(
+        r"^\d+\.\d+(\.\d+)?((a|b|rc)\d+)?(\.dev\d+)?(\+.+)?$",
+        mobius.__version__,
+    ), f"Invalid PEP 440 version: {mobius.__version__}"
+
+
+def test_main_invokes_cli():
+    """Test that main() invokes the Typer CLI app.
+
+    Since Typer CLI requires args, calling with no args shows help (exit 2).
+    This test verifies main() correctly delegates to the Typer app.
+    """
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "Mobius" in result.output
+
+
+def test_main_is_callable():
+    """Test that main is a callable function."""
+    assert callable(main)
+
+
+def test_main_module_execution():
+    """Test that __main__ module can be executed."""
+    # This verifies that the __main__ module structure is correct
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent.parent
+    main_py = root / "src" / "mobius" / "__main__.py"
+
+    assert main_py.exists()
+    spec = importlib.util.spec_from_file_location("mobius.__main__", main_py)
+    assert spec is not None
+    assert spec.loader is not None

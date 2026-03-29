@@ -1,0 +1,232 @@
+"""Orchestrator module for backend-neutral agent runtime integration.
+
+This module provides Epic 8 functionality - executing Mobius workflows
+via pluggable agent runtimes as an alternative execution mode.
+
+Key Components:
+    - AgentRuntime: Common runtime protocol
+    - ClaudeAgentAdapter: Claude runtime implementation
+    - CodexCliRuntime: Codex runtime implementation
+    - SessionTracker: Immutable session state tracking
+    - SessionRepository: Event-based session persistence
+    - OrchestratorRunner: Main orchestration logic
+    - MCPToolProvider: Integration with external MCP tools
+
+Usage:
+    from mobius.orchestrator import OrchestratorRunner, create_agent_runtime
+
+    adapter = create_agent_runtime(backend="claude")
+    runner = OrchestratorRunner(adapter, event_store)
+    result = await runner.execute_seed(seed, execution_id)
+
+    # With MCP tools:
+    from mobius.mcp.client.manager import MCPClientManager
+    mcp_manager = MCPClientManager()
+    runner = OrchestratorRunner(adapter, event_store, mcp_manager=mcp_manager)
+
+CLI Usage:
+    mobius run --orchestrator seed.yaml
+    mobius run --orchestrator seed.yaml --parallel  # Parallel AC execution
+    mobius run --orchestrator seed.yaml --resume <session_id>
+    mobius run --orchestrator seed.yaml --runtime codex
+    mobius run --orchestrator seed.yaml --mcp-config mcp.yaml
+"""
+
+from mobius.orchestrator.adapter import (
+    DEFAULT_TOOLS,
+    AgentMessage,
+    AgentRuntime,
+    ClaudeAgentAdapter,
+    ClaudeCodeRuntime,
+    RuntimeHandle,
+    TaskResult,
+)
+from mobius.orchestrator.codex_cli_runtime import CodexCliRuntime
+from mobius.orchestrator.coordinator import (
+    CoordinatorReview,
+    FileConflict,
+    LevelCoordinator,
+)
+
+# TODO: uncomment when OpenCode runtime is shipped
+# from mobius.orchestrator.opencode_runtime import (
+#     OpenCodeRuntime,
+#     OpenCodeRuntimeAdapter,
+# )
+
+try:
+    from mobius.orchestrator.dependency_analyzer import (
+        ACDependencySpec,
+        ACNode,
+        ACSharedRuntimeResource,
+        DependencyAnalysisError,
+        DependencyAnalyzer,
+        DependencyGraph,
+        ExecutionPlanningError,
+        ExecutionStage,
+        HybridExecutionPlanner,
+        StagedExecutionPlan,
+    )
+except ModuleNotFoundError:  # pragma: no cover - compatibility for partial installs
+    ACDependencySpec = None
+    ACNode = None
+    ACSharedRuntimeResource = None
+    DependencyAnalysisError = None
+    DependencyAnalyzer = None
+    DependencyGraph = None
+    ExecutionPlanningError = None
+    ExecutionStage = None
+    HybridExecutionPlanner = None
+    StagedExecutionPlan = None
+from mobius.orchestrator.events import (
+    create_mcp_tools_loaded_event,
+    create_progress_event,
+    create_session_cancelled_event,
+    create_session_completed_event,
+    create_session_failed_event,
+    create_session_paused_event,
+    create_session_started_event,
+    create_task_completed_event,
+    create_task_started_event,
+    create_tool_called_event,
+)
+from mobius.orchestrator.execution_strategy import (
+    AnalysisStrategy,
+    CodeStrategy,
+    ExecutionStrategy,
+    ResearchStrategy,
+    get_strategy,
+    register_strategy,
+)
+from mobius.orchestrator.level_context import (
+    ACContextSummary,
+    LevelContext,
+    build_context_prompt,
+    extract_level_context,
+)
+from mobius.orchestrator.mcp_config import (
+    ConfigError,
+    MCPClientConfig,
+    MCPConnectionConfig,
+    load_mcp_config,
+)
+from mobius.orchestrator.mcp_tools import (
+    MCPToolInfo,
+    MCPToolProvider,
+    MCPToolsLoadedEvent,
+    ToolConflict,
+)
+
+# TODO: uncomment when OpenCode runtime is shipped
+# from mobius.orchestrator.opencode_event_normalizer import (
+#     OpenCodeEventContext,
+#     OpenCodeEventNormalizer,
+#     normalize_opencode_event,
+# )
+from mobius.orchestrator.parallel_executor import (
+    ACExecutionOutcome,
+    ACExecutionResult,
+    ParallelACExecutor,
+    ParallelExecutionResult,
+    ParallelExecutionStageResult,
+    StageExecutionOutcome,
+)
+from mobius.orchestrator.runner import (
+    OrchestratorError,
+    OrchestratorResult,
+    OrchestratorRunner,
+    build_system_prompt,
+    build_task_prompt,
+)
+from mobius.orchestrator.runtime_factory import (
+    create_agent_runtime,
+    resolve_agent_runtime_backend,
+)
+from mobius.orchestrator.session import (
+    SessionRepository,
+    SessionStatus,
+    SessionTracker,
+)
+
+__all__ = [
+    # Adapter
+    "AgentRuntime",
+    "AgentMessage",
+    "ClaudeAgentAdapter",
+    "ClaudeCodeRuntime",
+    "CodexCliRuntime",
+    # "OpenCodeRuntime",  # TODO: uncomment when shipped
+    # "OpenCodeRuntimeAdapter",  # TODO: uncomment when shipped
+    "DEFAULT_TOOLS",
+    "RuntimeHandle",
+    "TaskResult",
+    "create_agent_runtime",
+    "resolve_agent_runtime_backend",
+    # Session
+    "SessionRepository",
+    "SessionStatus",
+    "SessionTracker",
+    # Runner
+    "OrchestratorError",
+    "OrchestratorResult",
+    "OrchestratorRunner",
+    "build_system_prompt",
+    "build_task_prompt",
+    # MCP Config
+    "ConfigError",
+    "MCPClientConfig",
+    "MCPConnectionConfig",
+    "load_mcp_config",
+    # MCP Tools
+    "MCPToolInfo",
+    "MCPToolProvider",
+    "MCPToolsLoadedEvent",
+    "ToolConflict",
+    # Events
+    "create_mcp_tools_loaded_event",
+    "create_progress_event",
+    "create_session_cancelled_event",
+    "create_session_completed_event",
+    "create_session_failed_event",
+    "create_session_paused_event",
+    "create_session_started_event",
+    "create_task_completed_event",
+    "create_task_started_event",
+    "create_tool_called_event",
+    # Parallel Execution
+    "ACDependencySpec",
+    "ACNode",
+    "ACSharedRuntimeResource",
+    "DependencyAnalyzer",
+    "DependencyAnalysisError",
+    "DependencyGraph",
+    "ExecutionPlanningError",
+    "ExecutionStage",
+    "HybridExecutionPlanner",
+    "StagedExecutionPlan",
+    "ACExecutionOutcome",
+    "ACExecutionResult",
+    "ParallelACExecutor",
+    "ParallelExecutionStageResult",
+    "ParallelExecutionResult",
+    "StageExecutionOutcome",
+    # "OpenCodeEventContext",  # TODO: uncomment when shipped
+    # "OpenCodeEventNormalizer",  # TODO: uncomment when shipped
+    # "normalize_opencode_event",  # TODO: uncomment when shipped
+    # Level Context
+    "ACContextSummary",
+    "LevelContext",
+    "build_context_prompt",
+    "extract_level_context",
+    # Coordinator
+    "CoordinatorReview",
+    "FileConflict",
+    "LevelCoordinator",
+    # Execution Strategy
+    "AnalysisStrategy",
+    "CodeStrategy",
+    "ExecutionStrategy",
+    "ResearchStrategy",
+    "get_strategy",
+    "register_strategy",
+]

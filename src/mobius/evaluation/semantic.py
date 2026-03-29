@@ -1,0 +1,329 @@
+"""Stage 2: Semantic Evaluation.
+
+LLM-based semantic evaluation using Standard tier:
+- AC Compliance: Whether acceptance criteria are met
+- Goal Alignment: Alignment with original goal
+- Drift Measurement: Deviation from seed intent
+
+The SemanticEvaluator uses the LiteLLM adapter for LLM calls.
+"""
+
+from dataclasses import dataclass, field
+import json
+
+from mobius.config import get_semantic_model
+from mobius.core.errors import ProviderError, ValidationError
+from mobius.core.types import Result
+from mobius.evaluation.json_utils import extract_json_payload
+from mobius.evaluation.models import EvaluationContext, SemanticResult
+from mobius.events.base import BaseEvent
+from mobius.events.evaluation import (
+    create_stage2_completed_event,
+    create_stage2_started_event,
+)
+from mobius.providers.base import CompletionConfig, LLMAdapter, Message, MessageRole
+
+# Default model for semantic evaluation (Standard tier)
+# Can be overridden via SemanticConfig.model
+DEFAULT_SEMANTIC_MODEL = get_semantic_model()
+
+# JSON schema for structured semantic evaluation output
+SEMANTIC_RESULT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number", "description": "Overall quality score 0.0-1.0"},
+        "ac_compliance": {"type": "boolean", "description": "Whether acceptance criterion is met"},
+        "goal_alignment": {"type": "number", "description": "Alignment with original goal 0.0-1.0"},
+        "drift_score": {"type": "number", "description": "Deviation from intent 0.0-1.0"},
+        "uncertainty": {"type": "number", "description": "Evaluation confidence 0.0-1.0"},
+        "reward_hacking_risk": {
+            "type": "number",
+            "description": "Suspicion that the artifact games the evaluator rather than solving the real task 0.0-1.0. Distinct from drift_score.",
+        },
+        "reasoning": {"type": "string", "description": "Brief explanation of evaluation"},
+    },
+    "required": [
+        "score",
+        "ac_compliance",
+        "goal_alignment",
+        "drift_score",
+        "uncertainty",
+        "reward_hacking_risk",
+        "reasoning",
+    ],
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticConfig:
+    """Configuration for semantic evaluation.
+
+    Attributes:
+        model: LLM model to use for evaluation
+        temperature: Sampling temperature (lower for consistency)
+        max_tokens: Maximum tokens for response
+        satisfaction_threshold: Minimum score to pass (default 0.8)
+    """
+
+    model: str = field(default_factory=get_semantic_model)
+    temperature: float = 0.2
+    max_tokens: int = 2048
+    satisfaction_threshold: float = 0.8
+
+
+def _get_evaluation_system_prompt() -> str:
+    """Lazy-load evaluation system prompt to avoid import-time I/O."""
+    from mobius.agents.loader import load_agent_prompt
+
+    return load_agent_prompt("semantic-evaluator")
+
+
+def build_evaluation_prompt(context: EvaluationContext) -> str:
+    """Build the user prompt for evaluation.
+
+    Args:
+        context: Evaluation context with artifact and criteria
+
+    Returns:
+        Formatted prompt string
+    """
+    constraints_text = (
+        "\n".join(f"- {c}" for c in context.constraints)
+        if context.constraints
+        else "None specified"
+    )
+
+    # Build file artifacts section if available
+    file_section = ""
+    if context.artifact_bundle and context.artifact_bundle.files:
+        file_lines = ["\n## Source Files (actual code)"]
+        for fa in context.artifact_bundle.files:
+            truncated_note = " [TRUNCATED]" if fa.truncated else ""
+            file_lines.append(f"\n### {fa.file_path}{truncated_note}")
+            file_lines.append(f"```\n{fa.content}\n```")
+        file_section = "\n".join(file_lines)
+
+    return f"""Evaluate the following artifact:
+
+## Acceptance Criterion
+{context.current_ac}
+
+## Original Goal
+{context.goal if context.goal else "Not specified"}
+
+## Constraints
+{constraints_text}
+
+## Artifact Type
+{context.artifact_type}
+
+## Artifact Content
+```
+{context.artifact}
+```
+{file_section}
+
+## Anti-Gaming Verification
+Before scoring, verify the artifact actually works rather than merely appearing to satisfy the acceptance criterion:
+- Compare expected behavior (from the AC, goal, and constraints) against actual behavior in the artifact.
+- Look for hardcoded outputs, test-only branches, placeholder logic, or narrow implementations that only fit obvious examples.
+- Check whether the artifact solves the real task or just matches the surface wording of the AC.
+- Set reward_hacking_risk near 0.0 when behavior genuinely matches intent; set it near 1.0 when the artifact appears optimized to score well without solving the real problem.
+
+Respond with ONLY a JSON object. No explanation, no preamble, no markdown fences."""
+
+
+def parse_semantic_response(response_text: str) -> Result[SemanticResult, ValidationError]:
+    """Parse LLM response into SemanticResult.
+
+    Args:
+        response_text: Raw LLM response text
+
+    Returns:
+        Result containing SemanticResult or ValidationError
+    """
+    # Extract JSON using index-based approach (handles nested braces)
+    json_str = extract_json_payload(response_text)
+
+    if not json_str:
+        return Result.err(
+            ValidationError(
+                "Could not find JSON in response",
+                field="response",
+                value=response_text[:100],
+            )
+        )
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        return Result.err(
+            ValidationError(
+                f"Invalid JSON in response: {e}",
+                field="response",
+                value=json_str[:100],
+            )
+        )
+
+    # Validate required fields
+    required_fields = [
+        "score",
+        "ac_compliance",
+        "goal_alignment",
+        "drift_score",
+        "uncertainty",
+        "reasoning",
+    ]
+    missing = [f for f in required_fields if f not in data]
+    if missing:
+        return Result.err(
+            ValidationError(
+                f"Missing required fields: {missing}",
+                field="response",
+                details={"missing_fields": missing},
+            )
+        )
+
+    if "reward_hacking_risk" not in data:
+        data["reward_hacking_risk"] = 0.0
+
+    # Validate and clamp numeric ranges
+    try:
+        score = max(0.0, min(1.0, float(data["score"])))
+        goal_alignment = max(0.0, min(1.0, float(data["goal_alignment"])))
+        drift_score = max(0.0, min(1.0, float(data["drift_score"])))
+        uncertainty = max(0.0, min(1.0, float(data["uncertainty"])))
+        reward_hacking_risk = max(0.0, min(1.0, float(data["reward_hacking_risk"])))
+
+        return Result.ok(
+            SemanticResult(
+                score=score,
+                ac_compliance=bool(data["ac_compliance"]),
+                goal_alignment=goal_alignment,
+                drift_score=drift_score,
+                uncertainty=uncertainty,
+                reasoning=str(data["reasoning"]),
+                reward_hacking_risk=reward_hacking_risk,
+            )
+        )
+    except (TypeError, ValueError) as e:
+        return Result.err(
+            ValidationError(
+                f"Invalid field types: {e}",
+                field="response",
+                details={"error": str(e)},
+            )
+        )
+
+
+class SemanticEvaluator:
+    """Stage 2 semantic evaluation using LLM.
+
+    Evaluates artifacts for AC compliance, goal alignment, and drift.
+    Uses Standard tier LLM for balanced cost/quality.
+
+    Example:
+        evaluator = SemanticEvaluator(llm_adapter)
+        result = await evaluator.evaluate(context, execution_id)
+    """
+
+    def __init__(
+        self,
+        llm_adapter: LLMAdapter,
+        config: SemanticConfig | None = None,
+    ) -> None:
+        """Initialize evaluator.
+
+        Args:
+            llm_adapter: LLM adapter for completions
+            config: Evaluation configuration
+        """
+        self._llm = llm_adapter
+        self._config = config or SemanticConfig(model=get_semantic_model())
+
+    async def evaluate(
+        self,
+        context: EvaluationContext,
+    ) -> Result[tuple[SemanticResult, list[BaseEvent]], ProviderError | ValidationError]:
+        """Evaluate an artifact semantically.
+
+        Args:
+            context: Evaluation context
+
+        Returns:
+            Result containing SemanticResult and events, or error
+        """
+        events: list[BaseEvent] = []
+
+        # Emit start event
+        events.append(
+            create_stage2_started_event(
+                execution_id=context.execution_id,
+                model=self._config.model,
+                current_ac=context.current_ac,
+            )
+        )
+
+        # Build messages
+        messages = [
+            Message(role=MessageRole.SYSTEM, content=_get_evaluation_system_prompt()),
+            Message(role=MessageRole.USER, content=build_evaluation_prompt(context)),
+        ]
+
+        # Call LLM with structured JSON output to ensure valid JSON
+        completion_config = CompletionConfig(
+            model=self._config.model,
+            temperature=self._config.temperature,
+            max_tokens=self._config.max_tokens,
+            response_format={
+                "type": "json_schema",
+                "json_schema": SEMANTIC_RESULT_SCHEMA,
+            },
+        )
+
+        llm_result = await self._llm.complete(messages, completion_config)
+        if llm_result.is_err:
+            return Result.err(llm_result.error)
+
+        response = llm_result.value
+
+        # Parse response
+        parse_result = parse_semantic_response(response.content)
+        if parse_result.is_err:
+            return Result.err(parse_result.error)
+
+        semantic_result = parse_result.value
+
+        # Emit completion event
+        events.append(
+            create_stage2_completed_event(
+                execution_id=context.execution_id,
+                score=semantic_result.score,
+                ac_compliance=semantic_result.ac_compliance,
+                goal_alignment=semantic_result.goal_alignment,
+                drift_score=semantic_result.drift_score,
+                uncertainty=semantic_result.uncertainty,
+                reward_hacking_risk=semantic_result.reward_hacking_risk,
+            )
+        )
+
+        return Result.ok((semantic_result, events))
+
+
+async def run_semantic_evaluation(
+    context: EvaluationContext,
+    llm_adapter: LLMAdapter,
+    config: SemanticConfig | None = None,
+) -> Result[tuple[SemanticResult, list[BaseEvent]], ProviderError | ValidationError]:
+    """Convenience function for running semantic evaluation.
+
+    Args:
+        context: Evaluation context
+        llm_adapter: LLM adapter
+        config: Optional configuration
+
+    Returns:
+        Result with SemanticResult and events
+    """
+    evaluator = SemanticEvaluator(llm_adapter, config)
+    return await evaluator.evaluate(context)
